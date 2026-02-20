@@ -850,6 +850,74 @@ font-family: ‘JetBrains Mono’, monospace;
 
 .hidden { display: none !important; }
 
+/* ── DEBUG PANEL ── */
+#debug-panel {
+position: fixed;
+inset: 0;
+background: rgba(0,0,0,0.92);
+backdrop-filter: blur(6px);
+z-index: 500;
+display: none;
+flex-direction: column;
+padding: 24px;
+gap: 16px;
+overflow: hidden;
+}
+#debug-panel.open { display: flex; }
+.debug-header {
+display: flex;
+align-items: center;
+justify-content: space-between;
+flex-shrink: 0;
+}
+.debug-title {
+font-family: ‘Syne’, sans-serif;
+font-weight: 700;
+font-size: 1rem;
+color: var(–accent);
+letter-spacing: 0.1em;
+}
+.debug-close {
+background: var(–surface2);
+border: 1px solid var(–border2);
+border-radius: 8px;
+padding: 6px 14px;
+color: var(–text);
+font-family: ‘Instrument Sans’, sans-serif;
+font-size: 0.8rem;
+cursor: pointer;
+}
+.debug-body {
+flex: 1;
+overflow-y: auto;
+background: #0a0a0c;
+border: 1px solid var(–border2);
+border-radius: 10px;
+padding: 20px;
+font-family: ‘JetBrains Mono’, monospace;
+font-size: 0.72rem;
+line-height: 1.7;
+color: #aaa;
+white-space: pre-wrap;
+word-break: break-all;
+}
+.debug-body .ok   { color: var(–accent); }
+.debug-body .warn { color: var(–warn); }
+.debug-body .err  { color: var(–danger); }
+.debug-body .head { color: var(–accent3); font-size: 0.78rem; }
+.debug-copy {
+background: rgba(127,255,178,0.1);
+border: 1px solid rgba(127,255,178,0.3);
+border-radius: 8px;
+padding: 8px 16px;
+color: var(–accent);
+font-family: ‘Instrument Sans’, sans-serif;
+font-size: 0.8rem;
+cursor: pointer;
+flex-shrink: 0;
+align-self: flex-start;
+}
+
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(–border2); border-radius: 3px; }
@@ -893,6 +961,19 @@ font-weight: 700;
 <div id="loading-overlay">
   <div class="spinner"></div>
   <div class="loading-text" id="loading-text">Läser schema…</div>
+</div>
+
+<!-- ── DEBUG PANEL ── -->
+
+<div id="debug-panel">
+  <div class="debug-header">
+    <div class="debug-title">🔍 PARSE DIAGNOSTICS</div>
+    <div style="display:flex;gap:8px">
+      <button class="debug-copy" onclick="copyDebug()">Copy all</button>
+      <button class="debug-close" onclick="document.getElementById('debug-panel').classList.remove('open')">Close ✕</button>
+    </div>
+  </div>
+  <div class="debug-body" id="debug-body"></div>
 </div>
 
 <!-- ── UPLOAD SCREEN ── -->
@@ -945,6 +1026,7 @@ font-weight: 700;
     <div class="header-right">
       <button class="hbtn" onclick="switchPerson()">⇄ <span class="hbtn-label">Switch</span></button>
       <button class="hbtn hbtn-accent" onclick="openExportModal()">↓ <span class="hbtn-label">Export</span></button>
+      <button class="hbtn" onclick="openDebug()" title="Diagnostik" style="font-size:0.7rem;opacity:0.6">🔍</button>
     </div>
   </div>
 
@@ -1149,47 +1231,125 @@ function parseSheet(ws, sheetName) {
   const yearMatch = sheetName.match(/20\d\d/);
   const baseYear  = yearMatch ? parseInt(yearMatch[0]) : 2025;
 
-  // ── STEP 1: Build a column→month map by scanning ALL of row 0 ──
-  // This is the key fix: merged cells may only appear at the leftmost column,
-  // so we scan every column and remember the last seen month.
-  const colMonthMap = buildColMonthMap(ws, maxCol, baseYear);
+  // ── STEP 1: Auto-detect which row holds DATUM + day numbers ──
+  // Different sheets put this on row 1 or row 2 (0-indexed).
+  let datumRow = -1;
+  for (let r = 0; r < Math.min(6, maxRow); r++) {
+    if (String(getCellValue(ws, r, 0) || '').trim().toUpperCase() === 'DATUM') {
+      datumRow = r;
+      break;
+    }
+  }
+  if (datumRow === -1) return; // unrecognised sheet format
 
-  // ── STEP 2: Find week blocks (every 8 cols, first col = DATUM row) ──
-  const weekBlocks = detectWeekBlocks(ws, maxCol);
+  // ── STEP 2: Auto-detect which row holds month names ──
+  // jan-aug / 2026 jan-okt: months in row 0
+  // 2025 sept-dec: months in row datumRow+1 (right below DATUM row)
+  let monthRow = -1;
+  for (let r = 0; r < Math.min(datumRow + 3, maxRow); r++) {
+    for (let c = 0; c < Math.min(maxCol, 20); c++) {
+      const v = String(getCellValue(ws, r, c) || '').trim().toUpperCase().replace(/\s+/g,' ');
+      if (MONTHS_SV.some(m => v.startsWith(m.toUpperCase()))) {
+        monthRow = r;
+        break;
+      }
+    }
+    if (monthRow >= 0) break;
+  }
+  if (monthRow === -1) monthRow = 0; // fallback
 
-  // ── STEP 3: Find person rows ──
+  // ── STEP 3: Build column→{month,year} map from monthRow ──
+  // Scan left-to-right, propagating last seen month to every subsequent column.
+  const colMonth = []; // sparse: colMonth[c] = {month, year} if a month label was seen at/before c
+  let curM = -1, curY = baseYear;
+  for (let c = 0; c < maxCol; c++) {
+    const v = String(getCellValue(ws, monthRow, c) || '').trim().toUpperCase().replace(/\s+/g,' ');
+    for (let i = 0; i < MONTHS_SV.length; i++) {
+      if (v.startsWith(MONTHS_SV[i].toUpperCase())) {
+        if (curM >= 0 && i < curM && curM >= 10) curY++; // year rollover Dec→Jan
+        curM = i;
+        break;
+      }
+    }
+    if (curM >= 0) colMonth[c] = { month: curM, year: curY };
+  }
+  // Fallback: if no months found at all, default to January
+  if (curM === -1) {
+    for (let c = 0; c < maxCol; c++) colMonth[c] = { month: 0, year: baseYear };
+  }
+
+  // ── STEP 4: Find week block start columns ──
+  // These are the columns where datumRow contains 'DATUM'.
+  const blockStarts = [];
+  for (let c = 0; c < maxCol; c++) {
+    if (String(getCellValue(ws, datumRow, c) || '').trim().toUpperCase() === 'DATUM') {
+      blockStarts.push(c);
+    }
+  }
+  if (blockStarts.length === 0) return;
+
+  // ── STEP 5: Find person rows ──
   const legendStart = findLegendStart(ws, maxRow);
-  const HEADER_WORDS = ['DATUM','VECKA','PÅMINNELSER','REMINDER','WEEK','DATE','NYHETSJOBBARE'];
-
+  const SKIP = ['DATUM','VECKA','PÅMINNELSER','REMINDER','WEEK','DATE',
+                'NYHETSJOBBARE','BYGGE','SCHEMAT','SEPTEMBER','OKTOBER',
+                'NOVEMBER','DECEMBER','JANUARI','FEBRUARI','MARS','APRIL',
+                'MAJ','JUNI','JULI','AUGUSTI'];
   const personRows = [];
   for (let r = 0; r < Math.min(legendStart, maxRow); r++) {
     const val = String(getCellValue(ws, r, 0) || '').trim();
-    if (val && val.length > 2 && !HEADER_WORDS.some(h => val.toUpperCase().startsWith(h))) {
+    if (val && val.length > 2 && !SKIP.some(h => val.toUpperCase().startsWith(h))) {
       personRows.push({ row: r, name: cleanPersonName(val) });
     }
   }
 
-  // Build legend from rows below legend start
+  // Build shift legend
   for (let r = legendStart; r < maxRow; r++) {
     buildShiftLegendEntry(String(getCellValue(ws, r, 0) || '').trim());
   }
 
-  // ── STEP 4: For each person × each week block × each day ──
+  // ── STEP 6: Helper — get base month for a block ──
+  // Look within the block's own columns first, then walk backwards.
+  function blockBaseMonth(blockStart) {
+    for (let c = blockStart; c < Math.min(blockStart + 8, maxCol); c++) {
+      if (colMonth[c]) return { ...colMonth[c] };
+    }
+    for (let c = blockStart - 1; c >= 0; c--) {
+      if (colMonth[c]) return { ...colMonth[c] };
+    }
+    return { month: 0, year: baseYear };
+  }
+
+  // ── STEP 7: Parse data — person × block × day ──
   personRows.forEach(({ row, name }) => {
     if (!scheduleData[name]) scheduleData[name] = [];
     if (!allPeople.includes(name)) allPeople.push(name);
 
-    weekBlocks.forEach(blockStart => {
+    blockStarts.forEach(blockStart => {
+      const base = blockBaseMonth(blockStart);
+      let bM = base.month, bY = base.year;
+      let prevDay = -1;
+
       for (let d = 1; d <= 7; d++) {
-        const dayNum = parseInt(getCellValue(ws, 2, blockStart + d));
+        const col = blockStart + d;
+        if (col >= maxCol) break;
+
+        const dayNum = parseInt(getCellValue(ws, datumRow, col));
         if (isNaN(dayNum) || dayNum < 1 || dayNum > 31) continue;
 
-        // ── KEY FIX: resolve date using colMonthMap ──
-        const date = resolveDateFromCol(dayNum, blockStart + d, colMonthMap, baseYear);
-        if (!date) continue;
+        // Rollover: large day followed by small day = new month
+        // (e.g. Jan 31 → Feb 1, or Feb 28 → Mar 1)
+        if (prevDay > 20 && dayNum < 8) {
+          bM++;
+          if (bM > 11) { bM = 0; bY++; }
+        }
+        prevDay = dayNum;
 
-        const raw = String(getCellValue(ws, row, blockStart + d) || '').trim();
+        const raw = String(getCellValue(ws, row, col) || '').trim();
         if (!raw) continue;
+
+        const date = new Date(bY, bM, dayNum);
+        date.setHours(0, 0, 0, 0); // normalize — prevents DST hour drift
+        if (isNaN(date.getTime())) continue;
 
         const parsed = parseAssignment(raw);
         scheduleData[name].push({ date, raw, ...parsed });
@@ -1198,70 +1358,6 @@ function parseSheet(ws, sheetName) {
 
     scheduleData[name].sort((a, b) => a.date - b.date);
   });
-}
-
-/**
- * Scan row 0 for month names across ALL columns.
- * Returns a map: colIndex → { month (0-indexed), year }
- * We propagate the last seen month rightward.
- */
-function buildColMonthMap(ws, maxCol, baseYear) {
-  const map = {};
-  let currentMonth = 0;
-  let currentYear  = baseYear;
-  let foundFirst   = false;
-
-  for (let c = 0; c < maxCol; c++) {
-    const val = String(getCellValue(ws, 0, c) || '').trim().toUpperCase();
-    const mIdx = MONTHS_SV.findIndex(m => val.startsWith(m.toUpperCase()));
-    if (mIdx !== -1) {
-      // Year rollover: if month goes backwards (Dec → Jan) increment year
-      if (foundFirst && mIdx < currentMonth && currentMonth >= 10) currentYear++;
-      currentMonth = mIdx;
-      foundFirst   = true;
-    }
-    if (foundFirst) {
-      map[c] = { month: currentMonth, year: currentYear };
-    }
-  }
-
-  // If we never found a month header, fill everything with baseYear/Jan as fallback
-  if (!foundFirst) {
-    for (let c = 0; c < maxCol; c++) map[c] = { month: 0, year: baseYear };
-  }
-
-  return map;
-}
-
-/**
- * Create a date from a day number and the column's month info.
- * Normalizes to midnight local time (avoids DST shift bugs).
- */
-function resolveDateFromCol(dayNum, col, colMonthMap, baseYear) {
-  // Walk left from col to find the nearest month mapping
-  let info = null;
-  for (let c = col; c >= 0; c--) {
-    if (colMonthMap[c]) { info = colMonthMap[c]; break; }
-  }
-  if (!info) info = { month: 0, year: baseYear };
-
-  try {
-    const d = new Date(info.year, info.month, dayNum);
-    d.setHours(0, 0, 0, 0);  // normalize — critical for DST safety
-    if (isNaN(d.getTime())) return null;
-    // Sanity check: result must be within ±2 months of expectation
-    if (d.getMonth() !== info.month) return null;
-    return d;
-  } catch(e) { return null; }
-}
-
-function detectWeekBlocks(ws, maxCol) {
-  const blocks = [];
-  for (let c = 0; c < maxCol; c += 8) {
-    const val = String(getCellValue(ws, 2, c) || '').toUpperCase();
-    if (val.includes('DATUM') || c === 0) blocks.push(c);
-  }
-  return blocks.length ? blocks : [0];
 }
 
 function findLegendStart(ws, maxRow) {
